@@ -6,6 +6,7 @@ Developed as a combined six-task project during an Embedded Systems Engineer int
 
 Features
 | Task | Capability |
+|---|---|
 | 1. Battery Intelligence Engine | Per-cell voltage, pack average, imbalance %, weakest/strongest cell, four-tier health classification |
 | 2. Safety Protection Kernel | Non-blocking, millis()-based relay/buzzer/LCD protection with anti-chatter debouncing |
 | 3. Embedded HMI | Fault-priority LCD status display |
