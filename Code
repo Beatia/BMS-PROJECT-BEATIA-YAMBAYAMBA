@@ -1,0 +1,402 @@
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#define RecMsgLen 40
+#define BLYNK_TEMPLATE_ID "TMPL2zYraCtKc"
+#define BLYNK_TEMPLATE_NAME "BMS BEATIA"
+#define BLYNK_AUTH_TOKEN "4U0CmryeUHcMjrkdlklVGwzxq3ArCdb2"
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[]= "Wokwi-GUEST";
+char pass[]= "";
+
+#define QueueSize 20
+#define ReconnectInterval 10000
+#define RssiInterval 5000
+#define RssiThreshold -80
+
+#define Cell1 34
+#define Cell2 35
+#define Cell3 32
+#define Cell4 33
+#define Relay 26
+#define Buzzer 25
+
+#define minV 1.5
+#define maxV 2.5
+#define cellnum 4
+
+#define Fluctuation 0.3
+#define FrozenLimit 10
+#define FaultCount 2
+#define RecoveryCount 3
+#define RelayDwell 3000
+
+#define Resolution 4095
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+enum HealthState{
+  Healthy,
+  MinorImbalance,
+  CriticalImbalance,
+  PackFailure,
+};
+
+enum Condition{
+  NoFault,
+  WeakVoltage,
+  HighVoltage,
+  SensorFailure,
+  Fluctuations,
+};
+
+int cell[cellnum]={Cell1, Cell2, Cell3, Cell4};
+
+int weakcell[cellnum];
+int strongcell[cellnum];
+int weakestcell;
+int strongestcell;
+
+float greatestv, lowestv;
+float cellvoltage[cellnum];
+float previousvoltage[cellnum];
+int rawvoltage[cellnum];
+int previousraw[cellnum];
+int frozencount[cellnum];
+float packavg;
+float imbalance;
+
+HealthState health=Healthy;
+Condition fault=NoFault;
+
+int relaystate=LOW;
+int faultstreak=0;
+int recoverstreak=0;
+unsigned long lastrelaychange=0;
+
+unsigned long interval=5000;
+unsigned long lastupdate=0;
+
+struct BMSEvent {
+  unsigned long timestamp;
+  HealthState health;
+  Condition fault;
+  int relaystate;
+  float cellvoltage[cellnum];
+  int rssi;
+  float packavg;
+  float imbalance;
+  int weakestcell;
+  int strongestcell;
+  char recommendation[RecMsgLen];   
+};
+
+BMSEvent eventQueue[QueueSize];
+int queuehead=0;
+int queuetail=0;
+int queuecount=0;
+
+HealthState lastsenthealth=Healthy;
+Condition lastsentfault=NoFault;
+int lastsentrelay=LOW;
+
+unsigned long lastreconnectattempt=0;
+unsigned long lastrssicheck=0;
+int rssivalue=0;
+int lastrssialert=0;
+
+void setup(){
+  Serial.begin(115200);
+  analogReadResolution(12);
+  
+  pinMode(Buzzer, OUTPUT);
+  noTone(Buzzer);
+  pinMode(Relay, OUTPUT);
+  digitalWrite(Relay, LOW);
+
+  Wire.begin(21,22);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Battery");
+  lcd.setCursor(0, 1);
+  lcd.print("Management");
+  delay(5000);
+  lcd.clear();
+
+  WiFi.begin(ssid, pass);
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+
+  for (int i=0;i<cellnum;i++){
+    previousraw[i]=-1;
+    frozencount[i]=0;
+  }
+}
+void loop(){
+  unsigned long timenow=millis();
+  if (timenow-lastupdate>=interval){
+    lastupdate=timenow;
+    readcells();
+    analysepack();
+    checkhealth();
+    safetykernel(timenow);
+    managewifi(timenow);
+    if (Blynk.connected()){
+      Blynk.run();
+    }
+    checkevent(timenow);
+    drainqueue();
+    checkrssi(timenow);
+    for (int i = 0; i < cellnum; i++) {
+      Serial.print("Cell ");
+      Serial.print(i + 1);
+      Serial.print(" - Voltage: ");
+      Serial.print(cellvoltage[i]);
+      Serial.print("  Status: ");
+      Serial.println(cellvoltage[i] > minV && cellvoltage[i] < maxV ? "Strong" : "Weak");}
+      Serial.print("Pack avg: ");
+      Serial.print(packavg);
+      Serial.print("V imbalance: ");
+      Serial.print(imbalance);
+      Serial.println("%");
+  }
+}
+void readcells() {
+  for (int i = 0; i < cellnum; i++) {
+    previousraw[i]=rawvoltage[i];
+    previousvoltage[i]=cellvoltage[i];
+    long raw = analogRead(cell[i]);
+    rawvoltage[i]=raw;
+    cellvoltage[i] = (raw / (float)Resolution) * 3.3;
+
+    if (rawvoltage[i]==previousraw[i]){
+      frozencount[i]++;
+    } else{
+      frozencount[i]=0;
+    }
+  }
+}
+
+void analysepack() {
+  greatestv=cellvoltage[0];
+  lowestv=cellvoltage[0];
+  strongestcell=cell[0];
+  weakestcell=cell[0];
+  float sum=0;
+
+  for (int i = 0; i < cellnum; i++) {
+    sum+=cellvoltage[i];
+    if (cellvoltage[i] > minV && cellvoltage[i] < maxV) {
+      strongcell[i] = cell[i];
+    } else {
+      weakcell[i] = cell[i];
+    }
+    if (cellvoltage[i]>greatestv){
+      greatestv=cellvoltage[i];
+      strongestcell=cell[i];
+    }
+    if (cellvoltage[i]<lowestv){
+      lowestv=cellvoltage[i];
+      weakestcell=cell[i];
+    }    
+  }
+  packavg=sum/cellnum;
+  imbalance=(packavg>0)? ((greatestv-lowestv)/packavg)*100.0: 0;
+}
+
+void checkhealth() {
+  fault=NoFault;
+
+  for (int i=0;i<cellnum;i++){
+    if (frozencount[i]>=FrozenLimit || rawvoltage[i]<=0 ||rawvoltage[i]>=Resolution){
+      fault=SensorFailure;
+    }
+    if (fabs(cellvoltage[i]-previousvoltage[i])>Fluctuation){
+      fault=Fluctuations;
+    }
+    if (cellvoltage[i]<minV){
+      fault=WeakVoltage;
+    }
+    if (cellvoltage[i]>maxV){
+      fault=HighVoltage;
+    }
+  }
+  for (int i=0;i<cellnum;i++){
+    if (cellvoltage[i]<minV || cellvoltage[i]>maxV){
+      health=PackFailure;
+      return;
+    }
+  }
+  if (imbalance>5.0){
+    health=CriticalImbalance;
+    return;
+  }
+  if (imbalance>2.0){
+    health=MinorImbalance;
+    return;
+  }
+  health=Healthy;
+}
+
+void safetykernel(unsigned long timenow) {
+  int badcycle=(health==PackFailure||fault==SensorFailure) ? 1:0;
+
+if (badcycle){
+  faultstreak++;
+} else{
+  recoverstreak++;
+  faultstreak=0;
+}
+int dwellok=(timenow-lastrelaychange)>=RelayDwell;
+if (relaystate==LOW && faultstreak>=FaultCount && dwellok){
+  relaystate=HIGH;
+  digitalWrite(Relay, HIGH);
+  lastrelaychange=timenow;
+}
+if (relaystate==HIGH && recoverstreak>=RecoveryCount && dwellok){
+  relaystate=LOW;
+  digitalWrite(Relay, LOW);
+  lastrelaychange=timenow;
+}
+  if (relaystate==HIGH){
+    tone(Buzzer, 2000);
+    lcd.setCursor(0, 0);
+    lcd.print("Pack Failure");
+    lcd.setCursor(0, 1);
+    lcd.print("Relay open  ");
+  }
+  else{
+    noTone(Buzzer);
+    lcd.setCursor(0, 0);
+    lcd.print("Pack OK");
+    lcd.setCursor(0, 1);
+    lcd.print("      ");   
+  }
+
+}
+
+void managewifi(unsigned long timenow){
+    if (WiFi.status()!=WL_CONNECTED || !Blynk.connected()){
+    if (timenow-lastreconnectattempt>=ReconnectInterval){
+      lastreconnectattempt=timenow;
+      if (WiFi.status()!=WL_CONNECTED){
+        WiFi.reconnect();
+      } else{
+        Blynk.connect();
+      }
+    }
+  }
+}
+
+int eventchanged(){
+  if (health!=lastsenthealth) return 1;
+  if (fault!=lastsentfault) return 1;
+  if (relaystate!=lastsentrelay) return 1;
+  for (int i=0;i<cellnum;i++){
+    if (cellvoltage[i]<minV || cellvoltage[i]>maxV) return 1;
+  }
+  return 0;
+}
+
+void checkevent(unsigned long timenow){
+  if (!eventchanged()){
+    return;
+  }
+  BMSEvent e;
+  getrecommendation(e.recommendation); 
+  e.packavg=packavg;
+  e.imbalance=imbalance;
+  e.weakestcell=weakestcell;
+  e.strongestcell=strongestcell;
+  e.timestamp=timenow;
+  e.health=health;
+  e.fault=fault;
+  e.relaystate=relaystate;
+  e.rssi=rssivalue;
+  for (int i=0;i<cellnum;i++){
+    e.cellvoltage[i]=cellvoltage[i];
+  }
+  lastsenthealth=health;
+  lastsentfault=fault;
+  lastsentrelay=relaystate;
+
+  if (Blynk.connected()){
+    sendevent(e);
+  } else{
+    queuevent(e);
+  }
+}
+void queuevent(BMSEvent e){
+  eventQueue[queuetail]=e;
+  queuetail=(queuetail+1)%QueueSize;
+  if (queuecount<QueueSize){
+    queuecount++;
+  } else{
+    queuehead=(queuehead+1)%QueueSize;
+  }
+}
+
+void drainqueue(){
+  if (queuecount==0 || !Blynk.connected()){
+    return;
+  }
+  BMSEvent e=eventQueue[queuehead];
+  queuehead=(queuehead+1)%QueueSize;
+  queuecount--;
+  sendevent(e);
+}
+
+void sendevent(BMSEvent e){
+  Blynk.virtualWrite(V0, e.health);
+  Blynk.virtualWrite(V1, e.fault);
+  Blynk.virtualWrite(V2, e.relaystate);
+  Blynk.virtualWrite(V3, e.rssi);
+  for (int i=0;i<cellnum;i++){
+    Blynk.virtualWrite(V4+i, e.cellvoltage[i]);
+  }
+  Blynk.virtualWrite(V8, e.timestamp);
+  Blynk.virtualWrite(V9, e.packavg);
+  Blynk.virtualWrite(V10, e.imbalance);
+  Blynk.virtualWrite(V11, e.weakestcell);
+  Blynk.virtualWrite(V12, e.strongestcell);
+  Blynk.virtualWrite(V13, e.recommendation);
+  char recommendation[RecMsgLen];   
+  if (e.health==CriticalImbalance || e.health==PackFailure){
+  Blynk.logEvent("pack_fault", e.recommendation);
+  }
+}
+
+void checkrssi(unsigned long timenow){
+  if (timenow-lastrssicheck<RssiInterval){
+    return;
+  }
+  lastrssicheck=timenow;
+  rssivalue=WiFi.RSSI();
+
+  int lowsignal=(rssivalue<RssiThreshold)?1:0;
+  if (lowsignal!=lastrssialert){
+    lastrssialert=lowsignal;
+    if (Blynk.connected()){
+      Blynk.virtualWrite(V14, rssivalue);
+    }
+  }
+}
+
+void getrecommendation(char *out){
+  if (health==PackFailure){
+    strcpy(out, "Stop use. Inspect cell wiring now.");
+  } else if (health==CriticalImbalance){
+    strcpy(out, "Balance pack before next cycle.");
+  } else if (fault==SensorFailure){
+    strcpy(out, "Check sensor connection at faulty cell.");
+  } else if (fault==Fluctuations){
+    strcpy(out, "Monitor - unstable readings detected.");
+  } else if (health==MinorImbalance){
+    strcpy(out, "Monitor pack, imbalance is mild.");
+  } else{
+    strcpy(out, "Pack nominal. No action required.");
+  } 
+}
