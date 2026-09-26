@@ -267,13 +267,17 @@ if (relaystate==HIGH && recoverstreak>=RecoveryCount && dwellok){
     lcd.print("Pack Failure");
     lcd.setCursor(0, 1);
     lcd.print("Relay open  ");
+    delay(10000);
+    lcd.clear();
   }
   else{
     noTone(Buzzer);
     lcd.setCursor(0, 0);
     lcd.print("Pack OK");
     lcd.setCursor(0, 1);
-    lcd.print("      ");   
+    lcd.print("      ");
+    delay(10000);
+    lcd.clear();   
   }
 
 }
@@ -400,3 +404,4 @@ void getrecommendation(char *out){
     strcpy(out, "Pack nominal. No action required.");
   } 
 }
+
