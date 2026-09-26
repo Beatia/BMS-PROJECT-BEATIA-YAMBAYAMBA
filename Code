@@ -244,42 +244,38 @@ void checkhealth() {
 void safetykernel(unsigned long timenow) {
   int badcycle=(health==PackFailure||fault==SensorFailure) ? 1:0;
 
-if (badcycle){
-  faultstreak++;
-} else{
-  recoverstreak++;
-  faultstreak=0;
-}
-int dwellok=(timenow-lastrelaychange)>=RelayDwell;
-if (relaystate==LOW && faultstreak>=FaultCount && dwellok){
-  relaystate=HIGH;
-  digitalWrite(Relay, HIGH);
-  lastrelaychange=timenow;
-}
-if (relaystate==HIGH && recoverstreak>=RecoveryCount && dwellok){
-  relaystate=LOW;
-  digitalWrite(Relay, LOW);
-  lastrelaychange=timenow;
-}
+  if (badcycle){
+    faultstreak++;
+    recoverstreak=0;
+  } else{
+    recoverstreak++;
+    faultstreak=0;
+  }
+
+  int dwellok=(timenow-lastrelaychange)>=RelayDwell;
+  if (relaystate==LOW && faultstreak>=FaultCount && dwellok){
+    relaystate=HIGH;
+    digitalWrite(Relay, HIGH);
+    lastrelaychange=timenow;
+  }
+  else if (relaystate==HIGH && recoverstreak>=RecoveryCount && dwellok){
+    relaystate=LOW;
+    digitalWrite(Relay, LOW);
+    lastrelaychange=timenow;
+  }
+
+  lcd.clear();
   if (relaystate==HIGH){
     tone(Buzzer, 2000);
     lcd.setCursor(0, 0);
     lcd.print("Pack Failure");
     lcd.setCursor(0, 1);
-    lcd.print("Relay open  ");
-    delay(10000);
-    lcd.clear();
-  }
-  else{
+    lcd.print("Relay open");
+  } else{
     noTone(Buzzer);
     lcd.setCursor(0, 0);
     lcd.print("Pack OK");
-    lcd.setCursor(0, 1);
-    lcd.print("      ");
-    delay(10000);
-    lcd.clear();   
   }
-
 }
 
 void managewifi(unsigned long timenow){
